@@ -1,0 +1,19 @@
+{
+  "name": "orvion",
+  "version": "1.0.0",
+  "description": "> **Autonomous AI Site Reliability Engineer** — monitors AWS, Azure, and GCP, detects anomalies with ML, performs Root Cause Analysis via Gemini 1.5 Flash, executes safe automated remediation, and self-learns from every incident.",
+  "main": "index.js",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.90.0"
+  }
+}

@@ -1,0 +1,412 @@
+networks:
+  neuralops-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  mongodb_data:
+  chroma_data:
+  ollama_models:
+  models_data:
+
+
+services:
+  # ── Infrastructure ─────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: neuralops-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-neuralops}
+      POSTGRES_USER: ${POSTGRES_USER:-neuralops}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-neuralops123}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init_db.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-neuralops} -d ${POSTGRES_DB:-neuralops}" ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    networks:
+      - neuralops-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: neuralops-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    networks:
+      - neuralops-network
+
+  mongodb:
+    image: mongo:7.0
+    container_name: neuralops-mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:-neuralops}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-neuralops123}
+      MONGO_INITDB_DATABASE: neuralops
+    volumes:
+      - mongodb_data:/data/db
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: [ "CMD", "mongosh", "--eval", "db.adminCommand('ping')", "--quiet" ]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    networks:
+      - neuralops-network
+
+  # FIX: chromadb/chroma image has no curl — use python urllib instead
+  chromadb:
+      image: chromadb/chroma:latest
+      container_name: neuralops-chromadb
+      restart: unless-stopped
+      environment:
+        IS_PERSISTENT: "TRUE"
+        PERSIST_DIRECTORY: /chroma/chroma
+        ANONYMIZED_TELEMETRY: "FALSE"
+      volumes:
+        - chroma_data:/chroma/chroma
+      ports:
+        - "8001:8000"
+      healthcheck:
+        test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8000' || exit 1"]
+        interval: 10s
+        timeout: 5s
+        retries: 20
+        start_period: 30s
+      networks:
+        - neuralops-network
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: neuralops-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_models:/root/.ollama
+    ports:
+      - "11434:11434"
+    entrypoint: [ "/bin/sh", "-c", "ollama serve & sleep 15 && ollama pull phi3:mini && wait" ]
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -sf http://localhost:11434/api/tags || wget -qO- http://localhost:11434/api/tags > /dev/null" ]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+    networks:
+      - neuralops-network
+
+  # ── API ────────────────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: modules/api/Dockerfile
+    container_name: neuralops-api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MODULE_NAME: api
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-neuralops}:${POSTGRES_PASSWORD:-neuralops123}@postgres:5432/${POSTGRES_DB:-neuralops}
+      REDIS_URL: redis://redis:6379
+      MONGODB_URL: mongodb://${MONGO_USER:-neuralops}:${MONGO_PASSWORD:-neuralops123}@mongodb:27017/neuralops?authSource=admin
+      MONGODB_DB_NAME: neuralops
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: 8000
+      OLLAMA_BASE_URL: http://ollama:11434
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-meta-llama/llama-3.1-8b-instruct:free}
+      SECRET_KEY: ${SECRET_KEY:-neuralops-secret-change-in-production}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-neuralops-jwt-secret-change-in-production}
+      POSTGRES_USER: ${POSTGRES_USER:-neuralops}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-neuralops123}
+      POSTGRES_DB: ${POSTGRES_DB:-neuralops}
+    volumes:
+      - ./training/data:/app/training/data:ro
+      - models_data:/app/models
+    networks:
+      - neuralops-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+    # FIX: use python urllib — curl may not exist in the api image
+    healthcheck:
+      test: [ "CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')" ]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 45s
+    ports:
+      - "8080:8080"
+
+  # ── Frontend ───────────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: neuralops-frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    networks:
+      - neuralops-network
+    depends_on:
+      api:
+        condition: service_healthy
+    # Frontend is nginx-based — curl IS available here
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -f http://localhost:80/ || exit 1" ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── Nginx reverse proxy ────────────────────────────────────────────────────────
+  # nginx:
+  #   image: nginx:alpine
+  #   container_name: neuralops-nginx
+  #   restart: unless-stopped
+  #   ports:
+  #     - "80:80"
+  #   volumes:
+  #     - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+  #   depends_on:
+  #     frontend:
+  #       condition: service_healthy
+  #     api:
+  #       condition: service_healthy
+  #   networks:
+  #     - neuralops-network
+
+  # ── Optional microservices ─────────────────────────────────────────────────────
+
+  ingestion:
+    build:
+      context: .
+      dockerfile: modules/ingestion/Dockerfile
+    container_name: neuralops-ingestion
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MODULE_NAME: ingestion
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-neuralops}:${POSTGRES_PASSWORD:-neuralops123}@postgres:5432/${POSTGRES_DB:-neuralops}
+      REDIS_URL: redis://redis:6379
+      MONGODB_URL: mongodb://${MONGO_USER:-neuralops}:${MONGO_PASSWORD:-neuralops123}@mongodb:27017/neuralops?authSource=admin
+    volumes:
+      - models_data:/app/models
+    networks:
+      - neuralops-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8010/health')" ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    ports:
+      - "8010:8010"
+
+  ml_engine:
+    build:
+      context: .
+      dockerfile: modules/ml_engine/Dockerfile
+    container_name: neuralops-ml-engine
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MODULE_NAME: ml_engine
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-neuralops}:${POSTGRES_PASSWORD:-neuralops123}@postgres:5432/${POSTGRES_DB:-neuralops}
+      REDIS_URL: redis://redis:6379
+    volumes:
+      - models_data:/app/models
+    networks:
+      - neuralops-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8020/health')" ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    ports:
+      - "8020:8020"
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: modules/orchestrator/Dockerfile
+    container_name: neuralops-orchestrator
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MODULE_NAME: orchestrator
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-neuralops}:${POSTGRES_PASSWORD:-neuralops123}@postgres:5432/${POSTGRES_DB:-neuralops}
+      REDIS_URL: redis://redis:6379
+    networks:
+      - neuralops-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8030/health')" ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    ports:
+      - "8030:8030"
+
+  rca_engine:
+    build:
+      context: .
+      dockerfile: modules/rca_engine/Dockerfile
+    container_name: neuralops-rca-engine
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MODULE_NAME: rca_engine
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-neuralops}:${POSTGRES_PASSWORD:-neuralops123}@postgres:5432/${POSTGRES_DB:-neuralops}
+      REDIS_URL: redis://redis:6379
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: 8000
+      OLLAMA_BASE_URL: http://ollama:11434
+    networks:
+      - neuralops-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    healthcheck:
+      test: [ "CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8040/health')" ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    ports:
+      - "8040:8040"
+
+  action_executor:
+    build:
+      context: .
+      dockerfile: modules/action_executor/Dockerfile
+    container_name: neuralops-action-executor
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MODULE_NAME: action_executor
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-neuralops}:${POSTGRES_PASSWORD:-neuralops123}@postgres:5432/${POSTGRES_DB:-neuralops}
+      REDIS_URL: redis://redis:6379
+    networks:
+      - neuralops-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8050/health')" ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    ports:
+      - "8050:8050"
+
+  memory:
+    build:
+      context: .
+      dockerfile: modules/memory/Dockerfile
+    container_name: neuralops-memory
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MODULE_NAME: memory
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-neuralops}:${POSTGRES_PASSWORD:-neuralops123}@postgres:5432/${POSTGRES_DB:-neuralops}
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: 8000
+    networks:
+      - neuralops-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8060/health')" ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    ports:
+      - "8060:8060"
+
+  chatbot:
+    build:
+      context: .
+      dockerfile: modules/chatbot/Dockerfile
+    container_name: neuralops-chatbot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MODULE_NAME: chatbot
+      REDIS_URL: redis://redis:6379
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: 8000
+      OLLAMA_BASE_URL: http://ollama:11434
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-meta-llama/llama-3.1-8b-instruct:free}
+    networks:
+      - neuralops-network
+    depends_on:
+      redis:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    healthcheck:
+      test: [ "CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8070/health')" ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    ports:
+      - "8070:8070"
